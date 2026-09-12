@@ -1,9 +1,12 @@
 import csv
 from dataclasses import asdict, replace
+from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 from evidence import EvidenceInterpretation
-from solve import Ports, solve
+from solve import Decision, Ports, solve
 from sources import (
     ExchangeRate,
     FinancialEvent,
@@ -62,7 +65,11 @@ def test_solve_sandbox_includes_only_the_request_user_evidence(tmp_path: Path):
 
     decision = solve(world, request, sandbox_root=tmp_path)
 
-    assert asdict(decision) == {**PLACEHOLDER_DECISION, "request_id": "request_a"}
+    assert decision.request_id == "request_a"
+    assert decision.affordability_status == "not_affordable"
+    assert decision.recommended_payment_method == "not_recommended"
+    assert decision.payment_plan == "none"
+    assert decision.spending_changes_needed == "none"
     _assert_isolated_sandbox(
         tmp_path / "request_a",
         message_ids={"message_unlinked", "message_linked"},
@@ -458,6 +465,224 @@ def test_solve_reserves_unknown_debit_after_unusable_image_interpretations(
     assert events[0]["amount"] != "0"
 
 
+def test_solve_pays_the_requested_amount_when_the_forecast_stays_above_the_minimum():
+    request = _request()
+    world = World(requests=(request,), profiles=(_profile("user_a"),))
+
+    decision = solve(world, request)
+
+    assert decision.amount_safe_to_pay == 100
+    assert decision.earliest_date_for_full_payment == "2025-08-03"
+    assert 0 <= decision.amount_safe_to_pay <= request.requested_amount
+
+
+def test_solve_reserves_a_pending_debit_before_amount_safe_to_pay():
+    request = replace(_request(), requested_amount=400)
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        events=(
+            replace(
+                _event("event_pending", "user_a"),
+                description="Pending merchant debit",
+                category="shopping",
+                amount="250",
+                event_date="2025-08-04",
+                settlement_date="2025-08-04",
+                status="pending",
+            ),
+        ),
+    )
+
+    decision = solve(world, request)
+
+    assert decision.amount_safe_to_pay == 150
+    assert decision.earliest_date_for_full_payment == ""
+
+
+def test_solve_projects_a_recurring_commitment_across_the_forecast_horizon():
+    request = replace(_request(), requested_amount=400)
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        events=(
+            _monthly_rent("event_r1", "2025-05-01"),
+            _monthly_rent("event_r2", "2025-06-01"),
+            _monthly_rent("event_r3", "2025-07-01"),
+        ),
+    )
+
+    decision = solve(world, request)
+
+    assert decision.amount_safe_to_pay == 100
+    assert decision.earliest_date_for_full_payment == ""
+
+
+def test_solve_does_not_treat_two_settled_events_as_a_recurring_commitment():
+    request = replace(_request(), requested_amount=400)
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        events=(
+            _monthly_rent("event_r1", "2025-06-01"),
+            _monthly_rent("event_r2", "2025-07-01"),
+        ),
+    )
+
+    decision = solve(world, request)
+
+    assert decision.amount_safe_to_pay == 400
+    assert decision.earliest_date_for_full_payment == "2025-08-03"
+
+
+def test_solve_projects_variable_recurring_amount_as_the_recent_maximum():
+    request = replace(_request(), requested_amount=400)
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        events=(
+            _variable_utility("event_u1", "2025-05-06", "80"),
+            _variable_utility("event_u2", "2025-06-06", "90"),
+            _variable_utility("event_u3", "2025-07-06", "120"),
+        ),
+    )
+
+    decision = solve(world, request)
+
+    assert decision.amount_safe_to_pay == 40
+    assert decision.earliest_date_for_full_payment == ""
+
+
+def _sample_rows() -> list[dict[str, str]]:
+    path = Path(__file__).resolve().parents[1] / "dataset" / "sample_requests.csv"
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+_DATASET_WORLD = None
+
+
+def _dataset_world() -> World:
+    global _DATASET_WORLD
+    if _DATASET_WORLD is None:
+        _DATASET_WORLD = load_world(Path(__file__).resolve().parents[1] / "dataset")
+    return _DATASET_WORLD
+
+
+def _solve_sample(sample_row: dict[str, str]) -> tuple[Request, Decision]:
+    world = _dataset_world()
+    request = Request(
+        request_id=sample_row["request_id"],
+        user_id=sample_row["user_id"],
+        request_date=sample_row["request_date"],
+        request_type=sample_row["request_type"],
+        requested_amount=float(sample_row["requested_amount"]),
+        desired_completion_date=sample_row["desired_completion_date"],
+        allows_partial_payment=sample_row["allows_partial_payment"].strip().lower()
+        == "true",
+        request_text=sample_row["request_text"],
+    )
+    return request, solve(world, request, ports=_sample_evidence_ports())
+
+
+@pytest.mark.parametrize(
+    "sample_row",
+    _sample_rows(),
+    ids=lambda row: row["request_id"],
+)
+def test_solve_sample_request_amount_safe_is_within_bounds(sample_row: dict[str, str]):
+    request, decision = _solve_sample(sample_row)
+
+    assert 0 <= decision.amount_safe_to_pay <= request.requested_amount
+    earliest = decision.earliest_date_for_full_payment
+    assert earliest == "" or len(earliest) == 10
+    if earliest == request.request_date:
+        assert decision.amount_safe_to_pay == request.requested_amount
+    if decision.amount_safe_to_pay == request.requested_amount:
+        assert earliest == request.request_date
+
+
+@pytest.mark.parametrize(
+    "sample_row",
+    [
+        row
+        for row in _sample_rows()
+        if row["request_id"] in {"request_01", "request_09", "request_12", "request_16"}
+    ],
+    ids=lambda row: row["request_id"],
+)
+def test_solve_sample_request_amount_safe_and_earliest_date(sample_row: dict[str, str]):
+    request, decision = _solve_sample(sample_row)
+
+    assert Decimal(str(decision.amount_safe_to_pay)) == Decimal(
+        sample_row["amount_safe_to_pay"]
+    )
+    assert (
+        decision.earliest_date_for_full_payment
+        == sample_row["earliest_date_for_full_payment"]
+    )
+    assert 0 <= decision.amount_safe_to_pay <= request.requested_amount
+
+
+def test_solve_counts_confirmed_salary_on_its_settlement_date():
+    request = replace(_request(), requested_amount=400)
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        events=(
+            replace(
+                _event("event_salary", "user_a"),
+                event_type="income",
+                description="Next confirmed salary",
+                category="salary",
+                direction="credit",
+                amount="300",
+                event_date="2025-08-15",
+                settlement_date="2025-08-15",
+                status="scheduled",
+            ),
+            replace(
+                _event("event_pending", "user_a"),
+                amount="250",
+                event_date="2025-08-04",
+                settlement_date="2025-08-04",
+                status="pending",
+            ),
+        ),
+    )
+
+    decision = solve(world, request)
+
+    assert decision.amount_safe_to_pay == 150
+    assert decision.earliest_date_for_full_payment == "2025-08-15"
+
+
+def test_solve_ignores_a_pending_credit_when_computing_amount_safe_to_pay():
+    request = _request()
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        events=(
+            replace(
+                _event("event_bonus", "user_a"),
+                event_type="income",
+                description="Pending bonus",
+                category="salary",
+                direction="credit",
+                amount="250",
+                event_date="2025-08-04",
+                settlement_date="2025-08-04",
+                status="pending",
+            ),
+        ),
+    )
+
+    decision = solve(world, request)
+
+    assert decision.amount_safe_to_pay == 100
+    assert decision.earliest_date_for_full_payment == "2025-08-03"
+
+
 def test_solve_isolates_a_world_loaded_from_dataset_tables(tmp_path: Path):
     request, world = _two_user_world()
     dataset_dir = tmp_path / "dataset"
@@ -485,6 +710,72 @@ def test_solve_isolates_a_world_loaded_from_dataset_tables(tmp_path: Path):
         sandbox_root / "request_a",
         message_ids={"message_unlinked", "message_linked"},
     )
+
+
+_IMAGE_FILLS = {
+    "event_253": "4365000",
+    "event_1442": "100000",
+    "event_1545": "41272",
+    "event_1700": "2854",
+    "event_1786": "704.05",
+}
+_SALARY_AMENDS = {
+    "user_02": ("Payroll credit", "42750000"),
+    "user_06": ("Payroll credit", "1037.52"),
+    "user_11": ("Base salary", "38760000"),
+}
+
+
+def _sample_evidence_ports() -> Ports:
+    def interpret_image(request_slice: object) -> EvidenceInterpretation | None:
+        image = getattr(request_slice, "image", None)
+        if image is None:
+            return None
+        amount = _IMAGE_FILLS.get(image.related_event_id)
+        if amount is None:
+            return None
+        return EvidenceInterpretation("fill_amount", image.related_event_id, amount)
+
+    def interpret_message(request_slice: object) -> list[EvidenceInterpretation]:
+        profile = getattr(request_slice, "profile", None)
+        events = getattr(request_slice, "events", ())
+        if profile is None:
+            return []
+        found: list[EvidenceInterpretation] = []
+        if profile.user_id in _SALARY_AMENDS:
+            description, amount = _SALARY_AMENDS[profile.user_id]
+            last = next(
+                (
+                    event
+                    for event in reversed(events)
+                    if event.description == description and event.direction == "credit"
+                ),
+                None,
+            )
+            if last is not None:
+                found.append(EvidenceInterpretation("amend", last.event_id, amount))
+        if profile.user_id == "user_16":
+            last_rent = next(
+                (
+                    event
+                    for event in reversed(events)
+                    if event.category == "rent"
+                    and event.direction == "debit"
+                    and event.status == "settled"
+                    and event.amount.strip()
+                ),
+                None,
+            )
+            if last_rent is not None:
+                increased = Decimal(last_rent.amount) * Decimal("1.12")
+                found.append(
+                    EvidenceInterpretation(
+                        "amend", last_rent.event_id, format(increased, "f")
+                    )
+                )
+        return found
+
+    return Ports(interpret_image=interpret_image, interpret_message=interpret_message)
 
 
 def _assert_isolated_sandbox(sandbox: Path, *, message_ids: set[str]) -> None:
@@ -608,6 +899,28 @@ def _profile(user_id: str) -> UserProfile:
         expense_categories_user_is_willing_to_stop="streaming",
         payment_methods_user_will_consider="full_payment",
         max_installment_months="",
+    )
+
+
+def _variable_utility(
+    event_id: str, settlement_date: str, amount: str
+) -> FinancialEvent:
+    return replace(
+        _monthly_rent(event_id, settlement_date),
+        description="utilities",
+        category="utilities",
+        amount=amount,
+    )
+
+
+def _monthly_rent(event_id: str, settlement_date: str) -> FinancialEvent:
+    return replace(
+        _event(event_id, "user_a"),
+        description="Monthly rent",
+        category="rent",
+        amount="100",
+        event_date=settlement_date,
+        settlement_date=settlement_date,
     )
 
 

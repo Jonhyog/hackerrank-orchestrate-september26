@@ -10,6 +10,7 @@ from evidence import (
     reserve_unknown_debits,
 )
 from exchange_rates import RateBook
+from ledger import amount_safe_and_earliest
 from slice import RequestSlice, for_request, write_sandbox
 from sources import Request, World
 
@@ -26,7 +27,7 @@ class Ports:
 @dataclass(frozen=True)
 class Decision:
     request_id: str
-    amount_safe_to_pay: int
+    amount_safe_to_pay: float
     affordability_status: str
     recommended_payment_method: str
     payment_plan: str
@@ -70,13 +71,16 @@ def solve(
     )
     if sandbox_root is not None:
         write_sandbox(request, request_slice, sandbox_root)
+    amount_safe, earliest = amount_safe_and_earliest(
+        request_slice.profile, request_slice.events, request
+    )
     return Decision(
         request_id=request.request_id,
-        amount_safe_to_pay=0,
+        amount_safe_to_pay=amount_safe,
         affordability_status="not_affordable",
         recommended_payment_method="not_recommended",
         payment_plan="none",
-        earliest_date_for_full_payment="",
+        earliest_date_for_full_payment=earliest,
         spending_changes_needed="none",
         decision_explanation="Stub Decision: no payment is recommended yet.",
     )
