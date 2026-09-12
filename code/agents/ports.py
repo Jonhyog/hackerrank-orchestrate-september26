@@ -5,10 +5,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from config import Config
+from dossier import RequestDossier, write_dossier
 from evidence.schemas import EvidenceInterpretation
 from slice import RequestSlice
 from solve import Ports
 from sources import FinancialEvent, Image, Message
+from writer.splice import explanation_text
 
 PromptFn = Callable[[str, Path], "PromptOutcome"]
 
@@ -72,6 +74,7 @@ def sdk_ports(
     model: str = "",
 ) -> Ports:
     run_prompt = prompt or _bound_cursor_prompt(api_key, model)
+
     def interpret_image(request_slice: RequestSlice) -> EvidenceInterpretation | None:
         if request_slice.image is None:
             return None
@@ -80,7 +83,13 @@ def sdk_ports(
             return None
         cwd = _write_image_sandbox(sandbox_root, media_dir, request_slice)
         outcome = _run(
-            run_prompt, _IMAGE_PROMPT, cwd, usage_log, "image", request_slice, model
+            run_prompt,
+            _IMAGE_PROMPT,
+            cwd,
+            usage_log,
+            "image",
+            _request_id(request_slice),
+            model,
         )
         return _parse_one(outcome.text)
 
@@ -91,11 +100,34 @@ def sdk_ports(
             return None
         cwd = _write_message_sandbox(sandbox_root, request_slice)
         outcome = _run(
-            run_prompt, _MESSAGE_PROMPT, cwd, usage_log, "message", request_slice, model
+            run_prompt,
+            _MESSAGE_PROMPT,
+            cwd,
+            usage_log,
+            "message",
+            _request_id(request_slice),
+            model,
         )
         return _parse_many(outcome.text)
 
-    return Ports(interpret_image=interpret_image, interpret_message=interpret_message)
+    def explain(dossier: RequestDossier) -> str:
+        cwd = write_dossier(sandbox_root, dossier)
+        outcome = _run(
+            run_prompt,
+            _EXPLAIN_PROMPT,
+            cwd,
+            usage_log,
+            "explain",
+            dossier.request.request_id,
+            model,
+        )
+        return explanation_text(outcome.text)
+
+    return Ports(
+        interpret_image=interpret_image,
+        interpret_message=interpret_message,
+        explain=explain,
+    )
 
 
 def _bound_cursor_prompt(api_key: str, model: str) -> PromptFn:
@@ -113,14 +145,14 @@ def _run(
     cwd: Path,
     usage_log: UsageLog,
     stage: str,
-    request_slice: RequestSlice,
+    request_id: str,
     model: str,
 ) -> PromptOutcome:
     outcome = prompt(text, cwd)
     usage_log.records.append(
         UsageRecord(
             stage=stage,
-            request_id=_request_id(request_slice),
+            request_id=request_id,
             model=model,
             input_tokens=outcome.input_tokens,
             output_tokens=outcome.output_tokens,
@@ -277,4 +309,12 @@ _MESSAGE_PROMPT = (
     "Return a JSON array of objects with keys action, event_id, amount, "
     "settlement_date. Allowed actions: fill_amount, cancel, delay, confirm, amend. "
     "Apply facts only to existing candidate events. Do not invent events or income."
+)
+_EXPLAIN_PROMPT = (
+    "Read the Request Dossier files in this working directory: request.csv, "
+    "decision.csv, forecast_horizon.csv, payment_options.csv, and "
+    "evidence_facts.csv. Write a concise decision_explanation grounded only in "
+    "those facts. Return only one JSON object with key decision_explanation. "
+    "Do not change numeric or enumerated Decision fields. Do not invent facts. "
+    "Do not emit amount_safe_to_pay or other Decision numbers."
 )

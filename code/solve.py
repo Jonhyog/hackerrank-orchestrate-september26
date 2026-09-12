@@ -4,8 +4,10 @@ from pathlib import Path
 from typing import Any
 
 from decision import decide
+from dossier import DossierDecision, RequestDossier, build_dossier
 from evidence import (
     EvidenceInterpretation,
+    accepted_interpretations,
     apply_interpretations,
     interpretations_from_port,
     reserve_unknown_debits,
@@ -14,6 +16,7 @@ from exchange_rates import RateBook
 from ledger import amount_safe_and_earliest
 from slice import RequestSlice, for_request, write_sandbox
 from sources import Request, World
+from writer.splice import splice
 
 InterpretationResult = EvidenceInterpretation | Sequence[EvidenceInterpretation] | None
 
@@ -22,7 +25,7 @@ InterpretationResult = EvidenceInterpretation | Sequence[EvidenceInterpretation]
 class Ports:
     interpret_image: Callable[[RequestSlice], InterpretationResult] | None = None
     interpret_message: Callable[[RequestSlice], InterpretationResult] | None = None
-    explain: Callable[..., Any] | None = None
+    explain: Callable[[RequestDossier], Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,7 @@ def solve(
             interpretations.extend(
                 interpretations_from_port(ports.interpret_message, request_slice)
             )
+    evidence_facts = accepted_interpretations(request_slice.events, interpretations)
     request_slice = replace(
         request_slice,
         events=reserve_unknown_debits(
@@ -83,7 +87,7 @@ def solve(
         amount_safe,
         earliest,
     )
-    return Decision(
+    engine = Decision(
         request_id=request.request_id,
         amount_safe_to_pay=amount_safe,
         affordability_status=plan.affordability_status,
@@ -93,3 +97,20 @@ def solve(
         spending_changes_needed=plan.spending_changes_needed,
         decision_explanation="Stub Decision: no payment is recommended yet.",
     )
+    if ports is None or ports.explain is None:
+        return engine
+    dossier = build_dossier(
+        request,
+        request_slice.profile,
+        DossierDecision(
+            amount_safe_to_pay=engine.amount_safe_to_pay,
+            affordability_status=engine.affordability_status,
+            recommended_payment_method=engine.recommended_payment_method,
+            payment_plan=engine.payment_plan,
+            earliest_date_for_full_payment=engine.earliest_date_for_full_payment,
+            spending_changes_needed=engine.spending_changes_needed,
+        ),
+        request_slice.payment_options,
+        evidence_facts,
+    )
+    return splice(engine, ports.explain(dossier))

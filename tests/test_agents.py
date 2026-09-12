@@ -6,10 +6,19 @@ import pytest
 
 from agents import PromptOutcome, UsageLog, sdk_ports
 from agents.prompt import cursor_prompt
+from dossier import DossierDecision, RequestDossier, build_dossier
 from evidence import EvidenceInterpretation
 from slice import RequestSlice
 from solve import solve
-from sources import FinancialEvent, Image, Message, Request, UserProfile, World
+from sources import (
+    FinancialEvent,
+    Image,
+    Message,
+    PaymentOption,
+    Request,
+    UserProfile,
+    World,
+)
 from utils.currency import Currency
 
 _MIN_PNG = (
@@ -132,9 +141,7 @@ def test_message_port_returns_cancel_from_stage_sandbox_only(tmp_path: Path):
         assert header in events_text
         assert "image_a" not in messages_text
         assert "image_a.png" not in names
-        return PromptOutcome(
-            text='[{"action":"cancel","event_id":"event_a"}]'
-        )
+        return PromptOutcome(text='[{"action":"cancel","event_id":"event_a"}]')
 
     ports = sdk_ports(
         sandbox_root=tmp_path / "sandbox",
@@ -175,6 +182,86 @@ def test_message_port_skips_when_user_has_no_in_scope_messages(tmp_path: Path):
 
     assert ports.interpret_message is not None
     assert ports.interpret_message(request_slice) is None
+
+
+def test_explanation_port_prompts_from_dossier_sandbox_only(tmp_path: Path):
+    seen_cwd: list[Path] = []
+
+    def prompt(_text: str, cwd: Path) -> PromptOutcome:
+        seen_cwd.append(cwd)
+        names = {path.name for path in cwd.iterdir()}
+        assert names == {
+            "request.csv",
+            "decision.csv",
+            "forecast_horizon.csv",
+            "payment_options.csv",
+            "evidence_facts.csv",
+        }
+        request_text = (cwd / "request.csv").read_text(encoding="utf-8")
+        decision_text = (cwd / "decision.csv").read_text(encoding="utf-8")
+        forecast_text = (cwd / "forecast_horizon.csv").read_text(encoding="utf-8")
+        options_text = (cwd / "payment_options.csv").read_text(encoding="utf-8")
+        facts_text = (cwd / "evidence_facts.csv").read_text(encoding="utf-8")
+        assert "request_a" in request_text
+        assert "laptop" in request_text
+        assert "affordable_now" in decision_text
+        assert "full_payment" in decision_text
+        assert "2025-11-01" in forecast_text
+        assert "option_a" in options_text
+        assert "cancel" in facts_text
+        assert "event_a" in facts_text
+        assert "financial_events.csv" not in names
+        assert "exchange_rates.csv" not in names
+        assert "from_currency" not in "".join(
+            path.read_text(encoding="utf-8") for path in cwd.glob("*.csv")
+        )
+        return PromptOutcome(text='{"decision_explanation":"Pay USD 100 today."}')
+
+    ports = sdk_ports(
+        sandbox_root=tmp_path / "sandbox",
+        media_dir=tmp_path / "media",
+        usage_log=UsageLog(),
+        prompt=prompt,
+    )
+    assert ports.explain is not None
+    explanation = ports.explain(_dossier())
+
+    assert explanation == "Pay USD 100 today."
+    assert seen_cwd
+    assert seen_cwd[0].name == "explain"
+    assert seen_cwd[0] != Path(__file__).resolve().parents[1]
+    assert seen_cwd[0].is_relative_to(tmp_path / "sandbox")
+
+
+def test_explanation_port_records_token_usage_for_the_sdk_call(tmp_path: Path):
+    usage = UsageLog()
+
+    def prompt(_text: str, _cwd: Path) -> PromptOutcome:
+        return PromptOutcome(
+            text='{"decision_explanation":"Pay USD 100 today."}',
+            input_tokens=18,
+            output_tokens=7,
+            total_tokens=25,
+        )
+
+    ports = sdk_ports(
+        sandbox_root=tmp_path / "sandbox",
+        media_dir=tmp_path / "media",
+        usage_log=usage,
+        prompt=prompt,
+        model="composer-2.5",
+    )
+    assert ports.explain is not None
+    ports.explain(_dossier())
+
+    assert len(usage.records) == 1
+    record = usage.records[0]
+    assert record.stage == "explain"
+    assert record.request_id == "request_a"
+    assert record.model == "composer-2.5"
+    assert record.input_tokens == 18
+    assert record.output_tokens == 7
+    assert record.total_tokens == 25
 
 
 def test_image_and_message_ports_use_separate_sandboxes(tmp_path: Path):
@@ -219,6 +306,63 @@ def test_image_and_message_ports_use_separate_sandboxes(tmp_path: Path):
     repo_root = Path(__file__).resolve().parents[1]
     sandbox = tmp_path / "sandbox"
     assert all(cwd != repo_root and cwd.is_relative_to(sandbox) for cwd in seen_cwd)
+
+
+def test_image_message_and_explanation_ports_use_separate_sandboxes(tmp_path: Path):
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    (media_dir / "image_a.png").write_bytes(_MIN_PNG)
+    seen_cwd: list[Path] = []
+
+    def prompt(_text: str, cwd: Path) -> PromptOutcome:
+        seen_cwd.append(cwd)
+        names = {path.name for path in cwd.iterdir()}
+        if "candidate_event.csv" in names:
+            return PromptOutcome(
+                text='{"action":"fill_amount","event_id":"event_blank","amount":"1849"}'
+            )
+        if "messages.csv" in names:
+            return PromptOutcome(text='[{"action":"cancel","event_id":"event_a"}]')
+        return PromptOutcome(
+            text='{"decision_explanation":"Pay after reviewing the dossier."}'
+        )
+
+    ports = sdk_ports(
+        sandbox_root=tmp_path / "sandbox",
+        media_dir=media_dir,
+        usage_log=UsageLog(),
+        prompt=prompt,
+    )
+    request_slice = RequestSlice(
+        request_id="request_a",
+        profile=None,
+        events=(
+            _event("event_blank", amount=""),
+            _event("event_a", amount="50"),
+        ),
+        messages=_message_slice().messages,
+        image=Image("image_a", "user_a", "request_a", "event_blank"),
+        payment_options=(),
+    )
+    assert ports.interpret_image is not None
+    assert ports.interpret_message is not None
+    assert ports.explain is not None
+    ports.interpret_image(request_slice)
+    ports.interpret_message(request_slice)
+    ports.explain(_dossier())
+
+    assert len(seen_cwd) == 3
+    assert len(set(seen_cwd)) == 3
+    assert {path.name for path in seen_cwd} == {"image", "message", "explain"}
+    repo_root = Path(__file__).resolve().parents[1]
+    sandbox = tmp_path / "sandbox"
+    assert all(cwd != repo_root and cwd.is_relative_to(sandbox) for cwd in seen_cwd)
+    explain_cwd = next(cwd for cwd in seen_cwd if cwd.name == "explain")
+    explain_names = {path.name for path in explain_cwd.iterdir()}
+    assert "image_a.png" not in explain_names
+    assert "messages.csv" not in explain_names
+    assert "financial_events.csv" not in explain_names
+    assert "exchange_rates.csv" not in explain_names
 
 
 def test_solve_applies_sdk_image_port_through_the_apply_gate(tmp_path: Path):
@@ -324,6 +468,58 @@ def test_solve_rejects_invented_event_from_sdk_message_port(tmp_path: Path):
     events_text = ledger.read_text(encoding="utf-8")
     assert "event_new" not in events_text
     assert "event_a" in events_text
+
+
+def test_solve_sdk_explanation_extra_numbers_do_not_enter_the_row(tmp_path: Path):
+    def prompt(_text: str, cwd: Path) -> PromptOutcome:
+        names = {path.name for path in cwd.iterdir()}
+        assert "financial_events.csv" not in names
+        assert "exchange_rates.csv" not in names
+        return PromptOutcome(
+            text=(
+                '{"decision_explanation":"Pay USD 100 today.","amount_safe_to_pay":1}'
+            )
+        )
+
+    ports = sdk_ports(
+        sandbox_root=tmp_path / "sandbox",
+        media_dir=tmp_path / "media",
+        usage_log=UsageLog(),
+        prompt=prompt,
+    )
+    request = Request(
+        request_id="request_a",
+        user_id="user_a",
+        request_date="2025-08-03",
+        request_type="purchase",
+        requested_amount=100.0,
+        desired_completion_date="2025-09-01",
+        allows_partial_payment=True,
+        request_text="laptop",
+    )
+    world = World(
+        requests=(request,),
+        profiles=(
+            UserProfile(
+                user_id="user_a",
+                home_currency=Currency.USD,
+                current_available_balance=500.0,
+                minimum_balance_to_keep=100.0,
+                financial_priorities="education",
+                expense_categories_to_protect="rent",
+                expense_categories_user_is_willing_to_reduce="dining",
+                expense_categories_user_is_willing_to_stop="streaming",
+                payment_methods_user_will_consider="full_payment",
+                max_installment_months="",
+            ),
+        ),
+    )
+
+    decision = solve(world, request, ports=ports)
+
+    assert decision.amount_safe_to_pay == 100
+    assert decision.affordability_status == "affordable_now"
+    assert decision.decision_explanation == "Pay USD 100 today."
 
 
 def test_image_port_skips_when_png_is_absent(tmp_path: Path):
@@ -462,6 +658,55 @@ def _message_slice() -> RequestSlice:
     )
 
 
+def _dossier() -> RequestDossier:
+    return build_dossier(
+        Request(
+            request_id="request_a",
+            user_id="user_a",
+            request_date="2025-08-03",
+            request_type="purchase",
+            requested_amount=100.0,
+            desired_completion_date="2025-09-01",
+            allows_partial_payment=True,
+            request_text="laptop",
+        ),
+        UserProfile(
+            user_id="user_a",
+            home_currency=Currency.USD,
+            current_available_balance=500.0,
+            minimum_balance_to_keep=100.0,
+            financial_priorities="education",
+            expense_categories_to_protect="rent",
+            expense_categories_user_is_willing_to_reduce="dining",
+            expense_categories_user_is_willing_to_stop="streaming",
+            payment_methods_user_will_consider="full_payment",
+            max_installment_months="",
+        ),
+        DossierDecision(
+            amount_safe_to_pay=100,
+            affordability_status="affordable_now",
+            recommended_payment_method="full_payment",
+            payment_plan="2025-08-03:100",
+            earliest_date_for_full_payment="2025-08-03",
+            spending_changes_needed="none",
+        ),
+        (
+            PaymentOption(
+                payment_option_id="option_a",
+                request_id="request_a",
+                payment_method="full_payment",
+                payment_amount=100.0,
+                number_of_payments=1,
+                first_payment_date="2025-08-03",
+                payment_frequency_days="",
+                financing_fee=0.0,
+                total_payable_amount=100.0,
+            ),
+        ),
+        (EvidenceInterpretation(action="cancel", event_id="event_a"),),
+    )
+
+
 def _message(message_id: str) -> Message:
     return Message(
         message_id=message_id,
@@ -472,4 +717,3 @@ def _message(message_id: str) -> Message:
         source_type="employer",
         message_text="note",
     )
-

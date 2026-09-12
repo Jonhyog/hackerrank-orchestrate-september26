@@ -25,6 +25,21 @@ def interpretations_from_port(
     return ()
 
 
+def accepted_interpretations(
+    events: tuple[FinancialEvent, ...],
+    interpretations: Sequence[EvidenceInterpretation],
+) -> tuple[EvidenceInterpretation, ...]:
+    by_id = {event.event_id: event for event in events}
+    accepted: list[EvidenceInterpretation] = []
+    for interpretation in _resolve_conflicts(interpretations):
+        current = by_id.get(interpretation.event_id)
+        if current is None:
+            continue
+        if _apply_one(current, interpretation) is not None:
+            accepted.append(interpretation)
+    return tuple(accepted)
+
+
 def apply_interpretations(
     events: tuple[FinancialEvent, ...],
     interpretations: Sequence[EvidenceInterpretation],

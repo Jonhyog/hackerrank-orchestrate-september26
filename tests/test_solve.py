@@ -20,6 +20,7 @@ from sources import (
     load_world,
 )
 from utils.currency import Currency
+from writer import write_output
 
 SourceRow = (
     Request
@@ -59,6 +60,170 @@ def test_solve_returns_placeholder_decision_for_the_request():
     decision = solve(world, request, ports=None)
 
     assert asdict(decision) == PLACEHOLDER_DECISION
+
+
+def test_solve_uses_explanation_text_and_keeps_engine_decision_fields():
+    request = _request()
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        payment_options=(_option("option_a", "request_a"),),
+    )
+
+    def explain(_dossier: object) -> str:
+        return "Pay USD 100 today from the Request Dossier."
+
+    decision = solve(world, request, ports=Ports(explain=explain))
+
+    assert decision.request_id == "request_a"
+    assert decision.amount_safe_to_pay == 100
+    assert decision.affordability_status == "affordable_now"
+    assert decision.recommended_payment_method == "full_payment"
+    assert decision.payment_plan == "2025-08-03:100"
+    assert decision.earliest_date_for_full_payment == "2025-08-03"
+    assert decision.spending_changes_needed == "none"
+    assert decision.decision_explanation == (
+        "Pay USD 100 today from the Request Dossier."
+    )
+
+
+def test_solve_discards_extra_numeric_fields_from_the_explanation_agent():
+    request = _request()
+    world = World(requests=(request,), profiles=(_profile("user_a"),))
+
+    def explain(_dossier: object) -> dict[str, object]:
+        return {
+            "decision_explanation": "Pay USD 100 today.",
+            "amount_safe_to_pay": 999,
+            "affordability_status": "not_affordable",
+            "recommended_payment_method": "not_recommended",
+            "payment_plan": "none",
+            "earliest_date_for_full_payment": "",
+            "spending_changes_needed": "stop:event_fake",
+        }
+
+    decision = solve(world, request, ports=Ports(explain=explain))
+
+    assert decision.amount_safe_to_pay == 100
+    assert decision.affordability_status == "affordable_now"
+    assert decision.recommended_payment_method == "full_payment"
+    assert decision.payment_plan == "2025-08-03:100"
+    assert decision.earliest_date_for_full_payment == "2025-08-03"
+    assert decision.spending_changes_needed == "none"
+    assert decision.decision_explanation == "Pay USD 100 today."
+
+
+def test_solve_explanation_port_receives_the_request_dossier_not_the_ledger():
+    request = _request()
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        events=(_event("event_a", "user_a"),),
+        payment_options=(_option("option_a", "request_a"),),
+        exchange_rates=(ExchangeRate("2025-08-03", Currency.EUR, Currency.USD, "2"),),
+        messages=(
+            _message("message_a", user_id="user_a", sent_at="2025-08-01T09:00:00Z"),
+        ),
+    )
+    seen: list[object] = []
+
+    def explain(dossier: object) -> str:
+        seen.append(dossier)
+        return "Grounded in the Request Dossier."
+
+    def interpret_message(_request_slice: object) -> EvidenceInterpretation:
+        return EvidenceInterpretation(action="cancel", event_id="event_a")
+
+    decision = solve(
+        world,
+        request,
+        ports=Ports(interpret_message=interpret_message, explain=explain),
+    )
+
+    assert decision.decision_explanation == "Grounded in the Request Dossier."
+    assert len(seen) == 1
+    dossier = seen[0]
+    assert getattr(dossier, "request").request_id == "request_a"
+    assert getattr(dossier, "decision").amount_safe_to_pay == 100
+    assert getattr(dossier, "decision").affordability_status == "affordable_now"
+    forecast = getattr(dossier, "forecast")
+    assert forecast.request_date == "2025-08-03"
+    assert forecast.horizon_end == "2025-11-01"
+    assert forecast.home_currency == "USD"
+    assert forecast.minimum_balance_to_keep == "100"
+    options = getattr(dossier, "payment_options")
+    assert [option.payment_option_id for option in options] == ["option_a"]
+    facts = getattr(dossier, "evidence_facts")
+    assert [(fact.action, fact.event_id) for fact in facts] == [("cancel", "event_a")]
+    assert not hasattr(dossier, "events")
+    assert not hasattr(dossier, "exchange_rates")
+    assert not hasattr(dossier, "profile")
+
+
+def test_solve_discards_numeric_fields_in_explanation_json_text(tmp_path: Path):
+    request = _request()
+    world = World(requests=(request,), profiles=(_profile("user_a"),))
+
+    def explain(_dossier: object) -> str:
+        return '{"decision_explanation":"Pay USD 100 today.","amount_safe_to_pay":999}'
+
+    decision = solve(world, request, ports=Ports(explain=explain))
+    dest = tmp_path / "output.csv"
+    write_output([decision], dest)
+    rows = _read_table(dest)
+
+    assert list(rows[0].keys()) == [
+        "request_id",
+        "amount_safe_to_pay",
+        "affordability_status",
+        "recommended_payment_method",
+        "payment_plan",
+        "earliest_date_for_full_payment",
+        "spending_changes_needed",
+        "decision_explanation",
+    ]
+    assert float(rows[0]["amount_safe_to_pay"]) == 100
+    assert rows[0]["affordability_status"] == "affordable_now"
+    assert rows[0]["decision_explanation"] == "Pay USD 100 today."
+    assert "999" not in rows[0].values()
+
+
+def test_solve_runs_explanation_for_a_request_with_no_evidence():
+    request = _request()
+    world = World(requests=(request,), profiles=(_profile("user_a"),))
+
+    def explain(_dossier: object) -> str:
+        return "No Evidence; the Decision still needs an Explanation."
+
+    decision = solve(world, request, ports=Ports(explain=explain))
+
+    assert decision.decision_explanation == (
+        "No Evidence; the Decision still needs an Explanation."
+    )
+
+
+def test_solve_dossier_omits_rejected_evidence_interpretations():
+    request, world = _message_event_world()
+    seen: list[object] = []
+
+    def interpret_message(_request_slice: object) -> EvidenceInterpretation:
+        return EvidenceInterpretation(
+            action="create", event_id="event_new", amount="25"
+        )
+
+    def explain(dossier: object) -> str:
+        seen.append(dossier)
+        return "Rejected invented income."
+
+    solve(
+        world,
+        request,
+        ports=Ports(interpret_message=interpret_message, explain=explain),
+    )
+
+    facts = getattr(seen[0], "evidence_facts")
+    assert facts == ()
+    assert all(getattr(fact, "event_id", "") != "event_new" for fact in facts)
 
 
 def test_solve_sandbox_includes_only_the_request_user_evidence(tmp_path: Path):
@@ -657,10 +822,7 @@ def test_solve_recommends_installments_that_match_a_supplied_payment_option():
 
     assert decision.affordability_status == "affordable_with_plan"
     assert decision.recommended_payment_method == "installments"
-    assert (
-        decision.payment_plan
-        == "2025-08-20:150|2025-09-17:150|2025-10-15:150"
-    )
+    assert decision.payment_plan == "2025-08-20:150|2025-09-17:150|2025-10-15:150"
     assert decision.spending_changes_needed == "none"
 
 
@@ -740,10 +902,7 @@ def test_solve_ranks_safe_installment_options_by_lower_total_paid():
     decision = solve(world, request)
 
     assert decision.recommended_payment_method == "installments"
-    assert (
-        decision.payment_plan
-        == "2025-08-20:150|2025-09-17:150|2025-10-15:150"
-    )
+    assert decision.payment_plan == "2025-08-20:150|2025-09-17:150|2025-10-15:150"
 
 
 def test_solve_uses_a_stop_spending_change_only_when_needed_for_a_safe_plan():
@@ -943,9 +1102,7 @@ def test_solve_sample_request_amount_safe_and_earliest_date(sample_row: dict[str
 def test_solve_sample_request_decision_invariants(sample_row: dict[str, str]):
     request, decision = _solve_sample(sample_row)
     profile = next(
-        item
-        for item in _dataset_world().profiles
-        if item.user_id == request.user_id
+        item for item in _dataset_world().profiles if item.user_id == request.user_id
     )
     options = [
         item
@@ -953,9 +1110,7 @@ def test_solve_sample_request_decision_invariants(sample_row: dict[str, str]):
         if item.request_id == request.request_id
     ]
     considered = {
-        part
-        for part in profile.payment_methods_user_will_consider.split("|")
-        if part
+        part for part in profile.payment_methods_user_will_consider.split("|") if part
     }
     method = decision.recommended_payment_method
     if method in {"full_payment", "partial_payment", "installments"}:
@@ -974,8 +1129,7 @@ def test_solve_sample_request_decision_invariants(sample_row: dict[str, str]):
         assert decision.affordability_status == "affordable_with_plan"
         assert 0 < decision.amount_safe_to_pay < request.requested_amount
         assert (
-            decision.earliest_date_for_full_payment
-            <= request.desired_completion_date
+            decision.earliest_date_for_full_payment <= request.desired_completion_date
         )
         first, second = decision.payment_plan.split("|")
         assert first == _plan_entry(
@@ -984,9 +1138,7 @@ def test_solve_sample_request_decision_invariants(sample_row: dict[str, str]):
         remainder = Decimal(str(request.requested_amount)) - Decimal(
             str(decision.amount_safe_to_pay)
         )
-        assert second == _plan_entry(
-            decision.earliest_date_for_full_payment, remainder
-        )
+        assert second == _plan_entry(decision.earliest_date_for_full_payment, remainder)
     if method == "installments":
         assert decision.affordability_status == "affordable_with_plan"
         max_months = profile.max_installment_months.strip()
@@ -1032,9 +1184,9 @@ def test_solve_sample_request_ranked_decision(sample_row: dict[str, str]):
     _request, decision = _solve_sample(sample_row)
 
     assert decision.affordability_status == sample_row["affordability_status"]
-    assert decision.recommended_payment_method == sample_row[
-        "recommended_payment_method"
-    ]
+    assert (
+        decision.recommended_payment_method == sample_row["recommended_payment_method"]
+    )
     assert decision.payment_plan == sample_row["payment_plan"]
     assert decision.spending_changes_needed == sample_row["spending_changes_needed"]
 
@@ -1347,9 +1499,7 @@ def _installment_plan(option: PaymentOption) -> str:
     )
 
 
-def _assert_spending_changes(
-    raw: str, profile: UserProfile, request: Request
-) -> None:
+def _assert_spending_changes(raw: str, profile: UserProfile, request: Request) -> None:
     if raw == "none":
         return
     parts = raw.split("|")

@@ -1,8 +1,21 @@
+from __future__ import annotations
+
 import csv
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from solve import Decision
+from writer.splice import explanation_text, splice
+
+if TYPE_CHECKING:
+    from solve import Decision
+
+__all__ = [
+    "COLUMNS",
+    "explanation_text",
+    "splice",
+    "write_output",
+]
 
 COLUMNS = (
     "request_id",
