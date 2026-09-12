@@ -2,6 +2,7 @@ import csv
 from dataclasses import asdict, replace
 from pathlib import Path
 
+from evidence import EvidenceInterpretation
 from solve import Ports, solve
 from sources import (
     ExchangeRate,
@@ -176,6 +177,287 @@ def test_solve_does_not_give_ports_or_sandbox_exchange_rates(tmp_path: Path):
         assert not hasattr(request_slice, "exchange_rates")
 
 
+def test_solve_fills_blank_amount_from_image_interpretation(tmp_path: Path):
+    request, world = _blank_amount_world()
+
+    def interpret_image(_request_slice: object) -> EvidenceInterpretation:
+        return EvidenceInterpretation(
+            action="fill_amount",
+            event_id="event_blank",
+            amount="1849",
+        )
+
+    solve(
+        world,
+        request,
+        ports=Ports(interpret_image=interpret_image),
+        sandbox_root=tmp_path,
+    )
+
+    events = _read_table(tmp_path / "request_a" / "financial_events.csv")
+    assert events[0]["event_id"] == "event_blank"
+    assert events[0]["amount"] == "1849"
+
+
+def test_solve_fills_blank_amount_with_zero_only_when_interpretation_says_so(
+    tmp_path: Path,
+):
+    request, world = _blank_amount_world()
+
+    def interpret_image(_request_slice: object) -> EvidenceInterpretation:
+        return EvidenceInterpretation(
+            action="fill_amount",
+            event_id="event_blank",
+            amount="0",
+        )
+
+    solve(
+        world,
+        request,
+        ports=Ports(interpret_image=interpret_image),
+        sandbox_root=tmp_path,
+    )
+
+    events = _read_table(tmp_path / "request_a" / "financial_events.csv")
+    assert events[0]["amount"] == "0"
+
+
+def test_solve_cancels_existing_event_from_message_interpretation(tmp_path: Path):
+    request, world = _message_event_world()
+
+    def interpret_message(_request_slice: object) -> EvidenceInterpretation:
+        return EvidenceInterpretation(action="cancel", event_id="event_a")
+
+    solve(
+        world,
+        request,
+        ports=Ports(interpret_message=interpret_message),
+        sandbox_root=tmp_path,
+    )
+
+    events = _read_table(tmp_path / "request_a" / "financial_events.csv")
+    assert events[0]["event_id"] == "event_a"
+    assert events[0]["status"] == "cancelled"
+
+
+def test_solve_delays_existing_event_from_message_interpretation(tmp_path: Path):
+    request, world = _message_event_world()
+
+    def interpret_message(_request_slice: object) -> EvidenceInterpretation:
+        return EvidenceInterpretation(
+            action="delay",
+            event_id="event_a",
+            settlement_date="2025-09-15",
+        )
+
+    solve(
+        world,
+        request,
+        ports=Ports(interpret_message=interpret_message),
+        sandbox_root=tmp_path,
+    )
+
+    events = _read_table(tmp_path / "request_a" / "financial_events.csv")
+    assert events[0]["settlement_date"] == "2025-09-15"
+
+
+def test_solve_confirms_existing_event_from_message_interpretation(tmp_path: Path):
+    request, world = _message_event_world()
+    world = replace(
+        world,
+        events=(replace(_event("event_a", "user_a"), status="pending"),),
+    )
+
+    def interpret_message(_request_slice: object) -> EvidenceInterpretation:
+        return EvidenceInterpretation(action="confirm", event_id="event_a")
+
+    solve(
+        world,
+        request,
+        ports=Ports(interpret_message=interpret_message),
+        sandbox_root=tmp_path,
+    )
+
+    events = _read_table(tmp_path / "request_a" / "financial_events.csv")
+    assert events[0]["status"] == "settled"
+
+
+def test_solve_amends_existing_event_from_message_interpretation(tmp_path: Path):
+    request, world = _message_event_world()
+
+    def interpret_message(_request_slice: object) -> EvidenceInterpretation:
+        return EvidenceInterpretation(
+            action="amend",
+            event_id="event_a",
+            amount="80",
+        )
+
+    solve(
+        world,
+        request,
+        ports=Ports(interpret_message=interpret_message),
+        sandbox_root=tmp_path,
+    )
+
+    events = _read_table(tmp_path / "request_a" / "financial_events.csv")
+    assert events[0]["amount"] == "80"
+
+
+def test_solve_rejects_interpretation_that_invents_income_or_a_new_event(
+    tmp_path: Path,
+):
+    request, world = _message_event_world()
+
+    def interpret_message(_request_slice: object) -> tuple[EvidenceInterpretation, ...]:
+        return (
+            EvidenceInterpretation(
+                action="fill_amount",
+                event_id="event_bonus",
+                amount="5000",
+            ),
+            EvidenceInterpretation(
+                action="create",
+                event_id="event_new_expense",
+                amount="25",
+            ),
+        )
+
+    solve(
+        world,
+        request,
+        ports=Ports(interpret_message=interpret_message),
+        sandbox_root=tmp_path,
+    )
+
+    events = _read_table(tmp_path / "request_a" / "financial_events.csv")
+    assert [event["event_id"] for event in events] == ["event_a"]
+    assert events[0]["amount"] == "50"
+    assert events[0]["status"] == "settled"
+
+
+def test_solve_rejects_interpretation_that_overrides_decision_rules(tmp_path: Path):
+    request, world = _message_event_world()
+
+    def interpret_message(_request_slice: object) -> EvidenceInterpretation:
+        return EvidenceInterpretation(
+            action="override_rules",
+            event_id="event_a",
+            amount="1",
+        )
+
+    solve(
+        world,
+        request,
+        ports=Ports(interpret_message=interpret_message),
+        sandbox_root=tmp_path,
+    )
+
+    events = _read_table(tmp_path / "request_a" / "financial_events.csv")
+    assert events[0]["amount"] == "50"
+    assert events[0]["status"] == "settled"
+
+
+def test_solve_prefers_explicit_cancel_over_fill_on_the_same_event(tmp_path: Path):
+    request, world = _blank_amount_world()
+    world = replace(
+        world,
+        messages=(
+            _message("message_a", user_id="user_a", sent_at="2025-08-01T09:00:00Z"),
+        ),
+    )
+
+    def interpret_image(_request_slice: object) -> EvidenceInterpretation:
+        return EvidenceInterpretation(
+            action="fill_amount",
+            event_id="event_blank",
+            amount="1849",
+        )
+
+    def interpret_message(_request_slice: object) -> EvidenceInterpretation:
+        return EvidenceInterpretation(action="cancel", event_id="event_blank")
+
+    solve(
+        world,
+        request,
+        ports=Ports(
+            interpret_image=interpret_image,
+            interpret_message=interpret_message,
+        ),
+        sandbox_root=tmp_path,
+    )
+
+    events = _read_table(tmp_path / "request_a" / "financial_events.csv")
+    assert events[0]["status"] == "cancelled"
+    assert events[0]["amount"] == ""
+
+
+def test_solve_retries_failed_image_interpretation_then_fills_blank_amount(
+    tmp_path: Path,
+):
+    request, world = _blank_amount_world()
+    attempts = iter(
+        (
+            RuntimeError("unusable"),
+            EvidenceInterpretation(
+                action="fill_amount",
+                event_id="event_blank",
+                amount="77",
+            ),
+        )
+    )
+
+    def interpret_image(_request_slice: object) -> EvidenceInterpretation:
+        outcome = next(attempts)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    solve(
+        world,
+        request,
+        ports=Ports(interpret_image=interpret_image),
+        sandbox_root=tmp_path,
+    )
+
+    events = _read_table(tmp_path / "request_a" / "financial_events.csv")
+    assert events[0]["amount"] == "77"
+
+
+def test_solve_reserves_unknown_debit_after_unusable_image_interpretations(
+    tmp_path: Path,
+):
+    request, world = _blank_amount_world()
+    attempts = iter(
+        (
+            RuntimeError("unusable"),
+            RuntimeError("unusable"),
+            EvidenceInterpretation(
+                action="fill_amount",
+                event_id="event_blank",
+                amount="99",
+            ),
+        )
+    )
+
+    def interpret_image(_request_slice: object) -> EvidenceInterpretation:
+        outcome = next(attempts)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    solve(
+        world,
+        request,
+        ports=Ports(interpret_image=interpret_image),
+        sandbox_root=tmp_path,
+    )
+
+    events = _read_table(tmp_path / "request_a" / "financial_events.csv")
+    assert events[0]["event_id"] == "event_blank"
+    assert events[0]["amount"] == ""
+    assert events[0]["amount"] != "0"
+
+
 def test_solve_isolates_a_world_loaded_from_dataset_tables(tmp_path: Path):
     request, world = _two_user_world()
     dataset_dir = tmp_path / "dataset"
@@ -219,6 +501,30 @@ def _assert_isolated_sandbox(sandbox: Path, *, message_ids: set[str]) -> None:
     assert [row["image_id"] for row in images] == ["image_a"]
     assert [row["user_id"] for row in images] == ["user_a"]
     assert [row["payment_option_id"] for row in options] == ["option_a"]
+
+
+def _blank_amount_world() -> tuple[Request, World]:
+    request = _request()
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        events=(replace(_event("event_blank", "user_a"), amount=""),),
+        images=(_image("image_a", "user_a", "request_a"),),
+    )
+    return request, world
+
+
+def _message_event_world() -> tuple[Request, World]:
+    request = _request()
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        events=(_event("event_a", "user_a"),),
+        messages=(
+            _message("message_a", user_id="user_a", sent_at="2025-08-01T09:00:00Z"),
+        ),
+    )
+    return request, world
 
 
 def _two_user_world() -> tuple[Request, World]:
