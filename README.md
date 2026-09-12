@@ -35,10 +35,34 @@ Your solution must:
 - Generate one prediction for every request
 - Write the final predictions to `output.csv` in the repository root
 
-Run the starter Python entry point with:
+Setup (Python, [uv](https://docs.astral.sh/uv/), Ruff):
 
 ```bash
-python3 code/main.py
+uv sync
+```
+
+Secrets come from the environment only. Copy `.env` from your own values if needed; never commit keys.
+
+```bash
+export CURSOR_API_KEY=...
+```
+
+Run the evaluation (writes repository-root `output.csv` by default):
+
+```bash
+uv run python code/main.py
+```
+
+Write a development table without overwriting the submission file:
+
+```bash
+uv run python code/main.py --output /tmp/buy-or-wait.csv
+```
+
+Show CLI help:
+
+```bash
+uv run python code/main.py --help
 ```
 
 After running your solution, confirm that `output.csv` exists in the repository root and contains the required columns and one row for every request.
