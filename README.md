@@ -41,7 +41,7 @@ Setup (Python, [uv](https://docs.astral.sh/uv/), Ruff):
 uv sync
 ```
 
-Secrets come from the environment only. Copy `.env` from your own values if needed; never commit keys.
+Secrets come from the environment only. Copy `.env.example` to `.env` and fill in your values; never commit `.env`.
 
 ```bash
 export CURSOR_API_KEY=...
