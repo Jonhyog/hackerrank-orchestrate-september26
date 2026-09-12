@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from sources.records import (
+    ExchangeRate,
     FinancialEvent,
     Image,
     Message,
@@ -12,10 +13,12 @@ from sources.records import (
     Request,
     UserProfile,
 )
+from utils.currency import Currency
 
 T = TypeVar("T")
 
 __all__ = [
+    "ExchangeRate",
     "FinancialEvent",
     "Image",
     "Message",
@@ -35,6 +38,7 @@ class World:
     messages: tuple[Message, ...] = ()
     images: tuple[Image, ...] = ()
     payment_options: tuple[PaymentOption, ...] = ()
+    exchange_rates: tuple[ExchangeRate, ...] = ()
 
 
 def load_world(dataset_dir: Path) -> World:
@@ -47,6 +51,10 @@ def load_world(dataset_dir: Path) -> World:
         payment_options=_load_rows(
             dataset_dir / "request_payment_options.csv",
             _option_from_row,
+        ),
+        exchange_rates=_load_rows(
+            dataset_dir / "exchange_rates.csv",
+            _rate_from_row,
         ),
     )
 
@@ -72,7 +80,7 @@ def _request_from_row(row: dict[str, str]) -> Request:
 def _profile_from_row(row: dict[str, str]) -> UserProfile:
     return UserProfile(
         user_id=row["user_id"],
-        home_currency=row["home_currency"],
+        home_currency=Currency(row["home_currency"]),
         current_available_balance=float(row["current_available_balance"]),
         minimum_balance_to_keep=float(row["minimum_balance_to_keep"]),
         financial_priorities=row["financial_priorities"],
@@ -97,7 +105,7 @@ def _event_from_row(row: dict[str, str]) -> FinancialEvent:
         category=row["category"],
         direction=row["direction"],
         amount=row["amount"],
-        currency=row["currency"],
+        currency=Currency(row["currency"]),
         event_date=row["event_date"],
         settlement_date=row["settlement_date"],
         status=row["status"],
@@ -139,4 +147,13 @@ def _option_from_row(row: dict[str, str]) -> PaymentOption:
         payment_frequency_days=row["payment_frequency_days"],
         financing_fee=float(row["financing_fee"]),
         total_payable_amount=float(row["total_payable_amount"]),
+    )
+
+
+def _rate_from_row(row: dict[str, str]) -> ExchangeRate:
+    return ExchangeRate(
+        rate_date=row["rate_date"],
+        from_currency=Currency(row["from_currency"]),
+        to_currency=Currency(row["to_currency"]),
+        rate=row["rate"],
     )

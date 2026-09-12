@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+from utils.currency import Currency
+
 
 @dataclass(frozen=True)
 class Request:
@@ -16,7 +18,7 @@ class Request:
 @dataclass(frozen=True)
 class UserProfile:
     user_id: str
-    home_currency: str
+    home_currency: Currency
     current_available_balance: float
     minimum_balance_to_keep: float
     financial_priorities: str
@@ -36,13 +38,21 @@ class FinancialEvent:
     category: str
     direction: str
     amount: str
-    currency: str
+    currency: Currency
     event_date: str
     settlement_date: str
     status: str
     linked_event_id: str
     flexibility: str
     minimum_allowed_amount: str
+
+
+@dataclass(frozen=True)
+class ExchangeRate:
+    rate_date: str
+    from_currency: Currency
+    to_currency: Currency
+    rate: str
 
 
 @dataclass(frozen=True)

@@ -1,8 +1,9 @@
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from exchange_rates import RateBook
 from slice import RequestSlice, for_request, write_sandbox
 from sources import Request, World
 
@@ -33,6 +34,14 @@ def solve(
     sandbox_root: Path | None = None,
 ) -> Decision:
     request_slice = for_request(world, request)
+    if request_slice.profile is not None:
+        request_slice = replace(
+            request_slice,
+            events=RateBook(world.exchange_rates).convert_cash_events(
+                request_slice.events,
+                request_slice.profile.home_currency,
+            ),
+        )
     if sandbox_root is not None:
         write_sandbox(request, request_slice, sandbox_root)
     if ports is not None:

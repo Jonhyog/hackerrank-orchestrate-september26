@@ -2,8 +2,9 @@ import csv
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from solve import solve
+from solve import Ports, solve
 from sources import (
+    ExchangeRate,
     FinancialEvent,
     Image,
     Message,
@@ -13,8 +14,17 @@ from sources import (
     World,
     load_world,
 )
+from utils.currency import Currency
 
-SourceRow = Request | UserProfile | FinancialEvent | Message | Image | PaymentOption
+SourceRow = (
+    Request
+    | UserProfile
+    | FinancialEvent
+    | Message
+    | Image
+    | PaymentOption
+    | ExchangeRate
+)
 
 PLACEHOLDER_DECISION = {
     "request_id": "request_26",
@@ -58,6 +68,114 @@ def test_solve_sandbox_includes_only_the_request_user_evidence(tmp_path: Path):
     )
 
 
+def test_solve_converts_foreign_cash_event_using_settlement_date_rate(
+    tmp_path: Path,
+):
+    request = _request()
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        events=(
+            replace(
+                _event("event_foreign", "user_a"),
+                amount="10",
+                currency=Currency.EUR,
+                settlement_date="2025-08-03",
+            ),
+        ),
+        exchange_rates=(
+            ExchangeRate("2025-08-03", Currency.EUR, Currency.USD, "2"),
+            ExchangeRate("2025-08-04", Currency.EUR, Currency.USD, "9"),
+        ),
+    )
+
+    decision = solve(world, request, sandbox_root=tmp_path)
+
+    assert decision.request_id == "request_a"
+    events = _read_table(tmp_path / "request_a" / "financial_events.csv")
+    assert events[0]["amount"] == "20"
+    assert events[0]["currency"] == "USD"
+
+
+def test_solve_does_not_use_a_rate_off_the_settlement_date(tmp_path: Path):
+    request = _request()
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        events=(
+            replace(
+                _event("event_foreign", "user_a"),
+                amount="10",
+                currency=Currency.EUR,
+                settlement_date="2025-08-03",
+            ),
+        ),
+        exchange_rates=(
+            ExchangeRate("2025-08-02", Currency.EUR, Currency.USD, "5"),
+            ExchangeRate("2025-08-04", Currency.EUR, Currency.USD, "9"),
+        ),
+    )
+
+    solve(world, request, sandbox_root=tmp_path)
+
+    events = _read_table(tmp_path / "request_a" / "financial_events.csv")
+    assert events[0]["amount"] == "10"
+    assert events[0]["currency"] == "EUR"
+
+
+def test_solve_does_not_convert_a_non_cash_financial_event(tmp_path: Path):
+    request = _request()
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        events=(
+            replace(
+                _event("event_valuation", "user_a"),
+                event_type="investment_valuation",
+                direction="non_cash",
+                amount="10",
+                currency=Currency.EUR,
+                settlement_date="2025-08-03",
+                status="unrealized",
+            ),
+        ),
+        exchange_rates=(ExchangeRate("2025-08-03", Currency.EUR, Currency.USD, "2"),),
+    )
+
+    solve(world, request, sandbox_root=tmp_path)
+
+    events = _read_table(tmp_path / "request_a" / "financial_events.csv")
+    assert events[0]["amount"] == "10"
+    assert events[0]["currency"] == "EUR"
+
+
+def test_solve_does_not_give_ports_or_sandbox_exchange_rates(tmp_path: Path):
+    request, world = _two_user_world()
+    world = replace(
+        world,
+        exchange_rates=(ExchangeRate("2025-07-01", Currency.EUR, Currency.USD, "2"),),
+    )
+    seen: list[object] = []
+
+    def capture(request_slice: object) -> None:
+        seen.append(request_slice)
+
+    solve(
+        world,
+        request,
+        ports=Ports(interpret_image=capture, interpret_message=capture),
+        sandbox_root=tmp_path,
+    )
+
+    sandbox = tmp_path / "request_a"
+    assert not (sandbox / "exchange_rates.csv").exists()
+    for path in sandbox.glob("*.csv"):
+        assert "from_currency" not in path.read_text(encoding="utf-8")
+    assert seen
+    for request_slice in seen:
+        assert not hasattr(request_slice, "exchange_rates")
+
+
 def test_solve_isolates_a_world_loaded_from_dataset_tables(tmp_path: Path):
     request, world = _two_user_world()
     dataset_dir = tmp_path / "dataset"
@@ -69,6 +187,10 @@ def test_solve_isolates_a_world_loaded_from_dataset_tables(tmp_path: Path):
     _write_csv(dataset_dir / "messages.csv", world.messages)
     _write_csv(dataset_dir / "images.csv", world.images)
     _write_csv(dataset_dir / "request_payment_options.csv", world.payment_options)
+    _write_csv(
+        dataset_dir / "exchange_rates.csv",
+        (ExchangeRate("2025-07-01", Currency.EUR, Currency.USD, "2"),),
+    )
 
     loaded = load_world(dataset_dir)
     loaded_request = next(
@@ -171,7 +293,7 @@ def _request() -> Request:
 def _profile(user_id: str) -> UserProfile:
     return UserProfile(
         user_id=user_id,
-        home_currency="USD",
+        home_currency=Currency.USD,
         current_available_balance=500.0,
         minimum_balance_to_keep=100.0,
         financial_priorities="education",
@@ -192,7 +314,7 @@ def _event(event_id: str, user_id: str) -> FinancialEvent:
         category="housing",
         direction="debit",
         amount="50",
-        currency="USD",
+        currency=Currency.USD,
         event_date="2025-07-01",
         settlement_date="2025-07-01",
         status="settled",
