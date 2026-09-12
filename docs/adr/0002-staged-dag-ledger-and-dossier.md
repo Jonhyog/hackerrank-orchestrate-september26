@@ -1,0 +1,3 @@
+# Staged DAG with User Ledger and Request Dossier
+
+A linear pipes-and-filters blob that ends in an agent Decision would mix engine work with untrusted Evidence and invite the agent to redo cash math. The system is a staged DAG: CSV sources and an Exchange Rate book feed a per-Request user slice; optional Evidence agents write interpretations; a deterministic gate applies them to a User Ledger; recurrence, forecast, and plan ranking produce a Decision; a Request Dossier goes to the Explanation agent; the Writer splices engine fields plus explanation text. The User Ledger never leaves the engine. The Request Dossier never contains Exchange Rates or the raw Ledger.
