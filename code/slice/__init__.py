@@ -17,6 +17,7 @@ from utils.dates import calendar_date
 
 @dataclass(frozen=True)
 class RequestSlice:
+    request_id: str
     profile: UserProfile | None
     events: tuple[FinancialEvent, ...]
     messages: tuple[Message, ...]
@@ -26,6 +27,7 @@ class RequestSlice:
 
 def for_request(world: World, request: Request) -> RequestSlice:
     return RequestSlice(
+        request_id=request.request_id,
         profile=next(
             (
                 profile

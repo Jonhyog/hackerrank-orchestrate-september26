@@ -5,6 +5,7 @@ description = "Buy or Wait? financial decision agent"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "cursor-sdk>=0.1",
     "python-dotenv>=1.0",
     "typer>=0.16",
 ]
@@ -22,6 +23,7 @@ package = false
 [tool.pytest.ini_options]
 pythonpath = ["code"]
 testpaths = ["tests"]
+markers = ["live: hits the Cursor SDK with a real API key"]
 
 [tool.ruff]
 src = ["code", "tests"]
