@@ -1,0 +1,5 @@
+# Agents Skills
+.agents/
+
+# Ignore log file
+log.txt
