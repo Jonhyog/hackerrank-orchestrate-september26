@@ -1,5 +1,6 @@
 import csv
 from dataclasses import asdict, replace
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -66,9 +67,9 @@ def test_solve_sandbox_includes_only_the_request_user_evidence(tmp_path: Path):
     decision = solve(world, request, sandbox_root=tmp_path)
 
     assert decision.request_id == "request_a"
-    assert decision.affordability_status == "not_affordable"
-    assert decision.recommended_payment_method == "not_recommended"
-    assert decision.payment_plan == "none"
+    assert decision.affordability_status == "affordable_now"
+    assert decision.recommended_payment_method == "full_payment"
+    assert decision.payment_plan == "2025-08-03:100"
     assert decision.spending_changes_needed == "none"
     _assert_isolated_sandbox(
         tmp_path / "request_a",
@@ -476,6 +477,316 @@ def test_solve_pays_the_requested_amount_when_the_forecast_stays_above_the_minim
     assert 0 <= decision.amount_safe_to_pay <= request.requested_amount
 
 
+def test_solve_recommends_full_payment_when_the_amount_is_safe_today():
+    request = _request()
+    world = World(requests=(request,), profiles=(_profile("user_a"),))
+
+    decision = solve(world, request)
+
+    assert decision.affordability_status == "affordable_now"
+    assert decision.recommended_payment_method == "full_payment"
+    assert decision.payment_plan == "2025-08-03:100"
+    assert decision.spending_changes_needed == "none"
+
+
+def test_solve_does_not_recommend_full_payment_when_the_user_will_not_consider_it():
+    request = _request()
+    world = World(
+        requests=(request,),
+        profiles=(
+            replace(
+                _profile("user_a"),
+                payment_methods_user_will_consider="installments",
+            ),
+        ),
+    )
+
+    decision = solve(world, request)
+
+    assert decision.recommended_payment_method != "full_payment"
+    assert decision.affordability_status != "affordable_now"
+
+
+def test_solve_recommends_wait_when_full_payment_becomes_safe_later():
+    request = replace(_request(), requested_amount=400)
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        events=(
+            replace(
+                _event("event_salary", "user_a"),
+                event_type="income",
+                description="Next confirmed salary",
+                category="salary",
+                direction="credit",
+                amount="300",
+                event_date="2025-08-15",
+                settlement_date="2025-08-15",
+                status="scheduled",
+            ),
+            replace(
+                _event("event_pending", "user_a"),
+                amount="250",
+                event_date="2025-08-04",
+                settlement_date="2025-08-04",
+                status="pending",
+            ),
+        ),
+    )
+
+    decision = solve(world, request)
+
+    assert decision.affordability_status == "affordable_later"
+    assert decision.recommended_payment_method == "wait"
+    assert decision.payment_plan == "2025-08-15:400"
+    assert decision.spending_changes_needed == "none"
+
+
+def test_solve_recommends_partial_payment_as_two_payments_summing_to_the_request():
+    request = replace(_request(), requested_amount=400)
+    world = World(
+        requests=(request,),
+        profiles=(
+            replace(
+                _profile("user_a"),
+                payment_methods_user_will_consider="partial_payment",
+            ),
+        ),
+        events=(
+            replace(
+                _event("event_salary", "user_a"),
+                event_type="income",
+                description="Next confirmed salary",
+                category="salary",
+                direction="credit",
+                amount="300",
+                event_date="2025-08-15",
+                settlement_date="2025-08-15",
+                status="scheduled",
+            ),
+            replace(
+                _event("event_pending", "user_a"),
+                amount="250",
+                event_date="2025-08-04",
+                settlement_date="2025-08-04",
+                status="pending",
+            ),
+        ),
+    )
+
+    decision = solve(world, request)
+
+    assert decision.affordability_status == "affordable_with_plan"
+    assert decision.recommended_payment_method == "partial_payment"
+    assert decision.payment_plan == "2025-08-03:150|2025-08-15:250"
+    assert decision.amount_safe_to_pay == 150
+    assert decision.earliest_date_for_full_payment == "2025-08-15"
+    assert decision.spending_changes_needed == "none"
+
+
+def test_solve_rejects_partial_payment_when_the_remainder_is_after_the_deadline():
+    request = replace(
+        _request(), requested_amount=400, desired_completion_date="2025-08-10"
+    )
+    world = World(
+        requests=(request,),
+        profiles=(
+            replace(
+                _profile("user_a"),
+                payment_methods_user_will_consider="partial_payment",
+            ),
+        ),
+        events=(
+            replace(
+                _event("event_salary", "user_a"),
+                event_type="income",
+                description="Next confirmed salary",
+                category="salary",
+                direction="credit",
+                amount="300",
+                event_date="2025-08-15",
+                settlement_date="2025-08-15",
+                status="scheduled",
+            ),
+            replace(
+                _event("event_pending", "user_a"),
+                amount="250",
+                event_date="2025-08-04",
+                settlement_date="2025-08-04",
+                status="pending",
+            ),
+        ),
+    )
+
+    decision = solve(world, request)
+
+    assert decision.recommended_payment_method != "partial_payment"
+    assert decision.payment_plan == "none"
+    assert decision.affordability_status == "not_affordable"
+
+
+def test_solve_recommends_installments_that_match_a_supplied_payment_option():
+    request = replace(
+        _request(), requested_amount=400, desired_completion_date="2025-10-15"
+    )
+    option = PaymentOption(
+        payment_option_id="option_installments",
+        request_id="request_a",
+        payment_method="installments",
+        payment_amount=150.0,
+        number_of_payments=3,
+        first_payment_date="2025-08-20",
+        payment_frequency_days="28",
+        financing_fee=50.0,
+        total_payable_amount=450.0,
+    )
+    world = World(
+        requests=(request,),
+        profiles=(
+            replace(
+                _profile("user_a"),
+                payment_methods_user_will_consider="installments",
+                max_installment_months="6",
+            ),
+        ),
+        events=_later_salary_world_events(),
+        payment_options=(option,),
+    )
+
+    decision = solve(world, request)
+
+    assert decision.affordability_status == "affordable_with_plan"
+    assert decision.recommended_payment_method == "installments"
+    assert (
+        decision.payment_plan
+        == "2025-08-20:150|2025-09-17:150|2025-10-15:150"
+    )
+    assert decision.spending_changes_needed == "none"
+
+
+def test_solve_rejects_installment_options_beyond_max_installment_months():
+    request = replace(
+        _request(), requested_amount=400, desired_completion_date="2025-10-15"
+    )
+    option = PaymentOption(
+        payment_option_id="option_long",
+        request_id="request_a",
+        payment_method="installments",
+        payment_amount=150.0,
+        number_of_payments=18,
+        first_payment_date="2025-08-20",
+        payment_frequency_days="28",
+        financing_fee=50.0,
+        total_payable_amount=2700.0,
+    )
+    world = World(
+        requests=(request,),
+        profiles=(
+            replace(
+                _profile("user_a"),
+                payment_methods_user_will_consider="installments",
+                max_installment_months="6",
+            ),
+        ),
+        events=_later_salary_world_events(),
+        payment_options=(option,),
+    )
+
+    decision = solve(world, request)
+
+    assert decision.recommended_payment_method == "not_recommended"
+    assert decision.payment_plan == "none"
+
+
+def test_solve_ranks_safe_installment_options_by_lower_total_paid():
+    request = replace(
+        _request(), requested_amount=400, desired_completion_date="2025-10-15"
+    )
+    cheap = PaymentOption(
+        payment_option_id="option_b",
+        request_id="request_a",
+        payment_method="installments",
+        payment_amount=150.0,
+        number_of_payments=3,
+        first_payment_date="2025-08-20",
+        payment_frequency_days="28",
+        financing_fee=50.0,
+        total_payable_amount=450.0,
+    )
+    costly = PaymentOption(
+        payment_option_id="option_a",
+        request_id="request_a",
+        payment_method="installments",
+        payment_amount=220.0,
+        number_of_payments=2,
+        first_payment_date="2025-08-10",
+        payment_frequency_days="28",
+        financing_fee=40.0,
+        total_payable_amount=480.0,
+    )
+    world = World(
+        requests=(request,),
+        profiles=(
+            replace(
+                _profile("user_a"),
+                payment_methods_user_will_consider="installments",
+                max_installment_months="6",
+            ),
+        ),
+        events=_later_salary_world_events(),
+        payment_options=(costly, cheap),
+    )
+
+    decision = solve(world, request)
+
+    assert decision.recommended_payment_method == "installments"
+    assert (
+        decision.payment_plan
+        == "2025-08-20:150|2025-09-17:150|2025-10-15:150"
+    )
+
+
+def test_solve_uses_a_stop_spending_change_only_when_needed_for_a_safe_plan():
+    request = replace(_request(), requested_amount=350)
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        events=(
+            _monthly_streaming("event_s1", "2025-05-01"),
+            _monthly_streaming("event_s2", "2025-06-01"),
+            _monthly_streaming("event_s3", "2025-07-01"),
+        ),
+    )
+
+    decision = solve(world, request)
+
+    assert decision.amount_safe_to_pay == 250
+    assert decision.affordability_status == "affordable_with_plan"
+    assert decision.recommended_payment_method == "full_payment"
+    assert decision.payment_plan == "2025-08-03:350"
+    assert decision.spending_changes_needed == "stop:event_s3"
+
+
+def test_solve_uses_a_reduce_spending_change_on_a_flexible_non_protected_event():
+    request = replace(_request(), requested_amount=250)
+    world = World(
+        requests=(request,),
+        profiles=(_profile("user_a"),),
+        events=(
+            _monthly_dining("event_d1", "2025-05-01"),
+            _monthly_dining("event_d2", "2025-06-01"),
+            _monthly_dining("event_d3", "2025-07-01"),
+        ),
+    )
+
+    decision = solve(world, request)
+
+    assert decision.affordability_status == "affordable_with_plan"
+    assert decision.recommended_payment_method == "full_payment"
+    assert decision.payment_plan == "2025-08-03:250"
+    assert decision.spending_changes_needed == "reduce_to:event_d3:40"
+
+
 def test_solve_reserves_a_pending_debit_before_amount_safe_to_pay():
     request = replace(_request(), requested_amount=400)
     world = World(
@@ -622,6 +933,110 @@ def test_solve_sample_request_amount_safe_and_earliest_date(sample_row: dict[str
         == sample_row["earliest_date_for_full_payment"]
     )
     assert 0 <= decision.amount_safe_to_pay <= request.requested_amount
+
+
+@pytest.mark.parametrize(
+    "sample_row",
+    _sample_rows(),
+    ids=lambda row: row["request_id"],
+)
+def test_solve_sample_request_decision_invariants(sample_row: dict[str, str]):
+    request, decision = _solve_sample(sample_row)
+    profile = next(
+        item
+        for item in _dataset_world().profiles
+        if item.user_id == request.user_id
+    )
+    options = [
+        item
+        for item in _dataset_world().payment_options
+        if item.request_id == request.request_id
+    ]
+    considered = {
+        part
+        for part in profile.payment_methods_user_will_consider.split("|")
+        if part
+    }
+    method = decision.recommended_payment_method
+    if method in {"full_payment", "partial_payment", "installments"}:
+        assert method in considered
+    if method == "wait":
+        assert "full_payment" in considered
+        assert decision.earliest_date_for_full_payment > request.request_date
+        assert decision.affordability_status == "affordable_later"
+    if method == "full_payment" and decision.spending_changes_needed == "none":
+        if decision.earliest_date_for_full_payment == request.request_date:
+            assert decision.affordability_status == "affordable_now"
+        else:
+            assert decision.affordability_status == "affordable_with_plan"
+    if method == "partial_payment":
+        assert request.allows_partial_payment
+        assert decision.affordability_status == "affordable_with_plan"
+        assert 0 < decision.amount_safe_to_pay < request.requested_amount
+        assert (
+            decision.earliest_date_for_full_payment
+            <= request.desired_completion_date
+        )
+        first, second = decision.payment_plan.split("|")
+        assert first == _plan_entry(
+            request.request_date, Decimal(str(decision.amount_safe_to_pay))
+        )
+        remainder = Decimal(str(request.requested_amount)) - Decimal(
+            str(decision.amount_safe_to_pay)
+        )
+        assert second == _plan_entry(
+            decision.earliest_date_for_full_payment, remainder
+        )
+    if method == "installments":
+        assert decision.affordability_status == "affordable_with_plan"
+        max_months = profile.max_installment_months.strip()
+        assert max_months
+        assert any(
+            _installment_plan(option) == decision.payment_plan
+            and option.number_of_payments <= int(max_months)
+            for option in options
+            if option.payment_method == "installments"
+        )
+    if method == "not_recommended":
+        assert decision.affordability_status == "not_affordable"
+        assert decision.payment_plan == "none"
+    _assert_spending_changes(decision.spending_changes_needed, profile, request)
+
+
+@pytest.mark.parametrize(
+    "sample_row",
+    [
+        row
+        for row in _sample_rows()
+        if row["request_id"]
+        in {
+            "request_01",
+            "request_02",
+            "request_05",
+            "request_07",
+            "request_09",
+            "request_10",
+            "request_12",
+            "request_14",
+            "request_15",
+            "request_16",
+            "request_17",
+            "request_20",
+            "request_22",
+            "request_24",
+        }
+    ],
+    ids=lambda row: row["request_id"],
+)
+def test_solve_sample_request_ranked_decision(sample_row: dict[str, str]):
+    _request, decision = _solve_sample(sample_row)
+
+    assert decision.affordability_status == sample_row["affordability_status"]
+    assert decision.recommended_payment_method == sample_row[
+        "recommended_payment_method"
+    ]
+    assert decision.payment_plan == sample_row["payment_plan"]
+    assert decision.spending_changes_needed == sample_row["spending_changes_needed"]
 
 
 def test_solve_counts_confirmed_salary_on_its_settlement_date():
@@ -910,6 +1325,120 @@ def _variable_utility(
         description="utilities",
         category="utilities",
         amount=amount,
+    )
+
+
+def _plan_entry(day: str, amount: Decimal) -> str:
+    quantized = amount.quantize(Decimal("0.01"))
+    if quantized == quantized.to_integral():
+        text = str(int(quantized))
+    else:
+        text = f"{quantized:.2f}"
+    return f"{day}:{text}"
+
+
+def _installment_plan(option: PaymentOption) -> str:
+    first = date.fromisoformat(option.first_payment_date)
+    step = int(option.payment_frequency_days)
+    amount = Decimal(str(option.payment_amount))
+    return "|".join(
+        _plan_entry((first + timedelta(days=index * step)).isoformat(), amount)
+        for index in range(option.number_of_payments)
+    )
+
+
+def _assert_spending_changes(
+    raw: str, profile: UserProfile, request: Request
+) -> None:
+    if raw == "none":
+        return
+    parts = raw.split("|")
+    assert 1 <= len(parts) <= 3
+    seen: set[str] = set()
+    protected = {
+        part for part in profile.expense_categories_to_protect.split("|") if part
+    }
+    can_stop = {
+        part
+        for part in profile.expense_categories_user_is_willing_to_stop.split("|")
+        if part
+    }
+    can_reduce = {
+        part
+        for part in profile.expense_categories_user_is_willing_to_reduce.split("|")
+        if part
+    }
+    events = {
+        event.event_id: event
+        for event in _dataset_world().events
+        if event.user_id == request.user_id
+    }
+    for part in parts:
+        if part.startswith("stop:"):
+            event_id = part.split(":", 1)[1]
+            assert event_id not in seen
+            seen.add(event_id)
+            event = events[event_id]
+            assert event.category not in protected
+            assert event.category in can_stop
+            assert event.flexibility in {"stoppable", "reducible_or_stoppable"}
+        elif part.startswith("reduce_to:"):
+            _kind, event_id, _amount = part.split(":", 2)
+            assert event_id not in seen
+            seen.add(event_id)
+            event = events[event_id]
+            assert event.category not in protected
+            assert event.category in can_reduce
+            assert event.flexibility in {"reducible", "reducible_or_stoppable"}
+        else:
+            raise AssertionError(part)
+
+
+def _later_salary_world_events() -> tuple[FinancialEvent, ...]:
+    return (
+        replace(
+            _event("event_salary", "user_a"),
+            event_type="income",
+            description="Next confirmed salary",
+            category="salary",
+            direction="credit",
+            amount="300",
+            event_date="2025-09-15",
+            settlement_date="2025-09-15",
+            status="scheduled",
+        ),
+        replace(
+            _event("event_pending", "user_a"),
+            amount="200",
+            event_date="2025-08-04",
+            settlement_date="2025-08-04",
+            status="pending",
+        ),
+    )
+
+
+def _monthly_dining(event_id: str, settlement_date: str) -> FinancialEvent:
+    return replace(
+        _event(event_id, "user_a"),
+        description="Weekend food delivery",
+        category="dining",
+        amount="80",
+        event_date=settlement_date,
+        settlement_date=settlement_date,
+        flexibility="reducible",
+        minimum_allowed_amount="40",
+    )
+
+
+def _monthly_streaming(event_id: str, settlement_date: str) -> FinancialEvent:
+    return replace(
+        _event(event_id, "user_a"),
+        description="Family streaming plan",
+        category="streaming",
+        amount="50",
+        event_date=settlement_date,
+        settlement_date=settlement_date,
+        flexibility="stoppable",
     )
 
 

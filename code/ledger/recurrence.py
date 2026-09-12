@@ -118,13 +118,22 @@ def occupied_dates(events: tuple[FinancialEvent, ...]) -> set[tuple[str, str, st
 def _cadence(gaps: list[int]) -> tuple[str, int] | None:
     if not gaps:
         return None
-    if all(27 <= gap <= 35 for gap in gaps):
+    if _mostly_monthly(gaps):
         return ("monthly", 1)
     if all(6 <= gap <= 9 for gap in gaps):
         return ("weekly", 7)
     if all(13 <= gap <= 17 for gap in gaps):
         return ("biweekly", 14)
     return None
+
+
+def _mostly_monthly(gaps: list[int]) -> bool:
+    if all(27 <= gap <= 35 for gap in gaps):
+        return True
+    if len(gaps) < 2 or any(gap > 45 for gap in gaps):
+        return False
+    in_band = sum(1 for gap in gaps if 27 <= gap <= 35)
+    return in_band >= len(gaps) - 1 and in_band >= 1
 
 
 def _next_date(current: date, commitment: RecurringCommitment) -> date:

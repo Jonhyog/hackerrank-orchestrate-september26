@@ -3,6 +3,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from decision import decide
 from evidence import (
     EvidenceInterpretation,
     apply_interpretations,
@@ -74,13 +75,21 @@ def solve(
     amount_safe, earliest = amount_safe_and_earliest(
         request_slice.profile, request_slice.events, request
     )
+    plan = decide(
+        request_slice.profile,
+        request_slice.events,
+        request,
+        request_slice.payment_options,
+        amount_safe,
+        earliest,
+    )
     return Decision(
         request_id=request.request_id,
         amount_safe_to_pay=amount_safe,
-        affordability_status="not_affordable",
-        recommended_payment_method="not_recommended",
-        payment_plan="none",
+        affordability_status=plan.affordability_status,
+        recommended_payment_method=plan.recommended_payment_method,
+        payment_plan=plan.payment_plan,
         earliest_date_for_full_payment=earliest,
-        spending_changes_needed="none",
+        spending_changes_needed=plan.spending_changes_needed,
         decision_explanation="Stub Decision: no payment is recommended yet.",
     )
